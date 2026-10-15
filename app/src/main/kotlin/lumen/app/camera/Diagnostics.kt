@@ -18,10 +18,10 @@ data class IdRow(val id: String, val listed: Boolean, val parent: String? = null
 
 /** Phase 1 orchestration. All camera contact runs one-ID-at-a-time on a single background thread. */
 class Diagnostics(private val app: LumenApp) {
-    private val gate = app.gate
+    private val cameraGate = app.gate
     private val core = app.gateCore
     private val exec = Executors.newSingleThreadExecutor { Thread(it, "diag") }
-    private val prober = Prober(gate, app.camHandler)
+    private val prober = Prober(cameraGate, app.camHandler)
 
     private val _rows = MutableStateFlow<List<IdRow>>(emptyList())
     private val _cameras = MutableStateFlow<Map<String, CameraInfo>>(emptyMap())
@@ -35,14 +35,16 @@ class Diagnostics(private val app: LumenApp) {
     val status: StateFlow<String> = _status
     val busy: StateFlow<Boolean> = _busy
     val probeResults: StateFlow<Map<String, String>> = _probeResults
+
     private val _gate = MutableStateFlow(core.snapshot)
     val gate: StateFlow<GateState> = _gate
-    private val quick = Executors.newSingleThreadExecutor { Thread(it, "diag-quick") }
 
+    private val quick = Executors.newSingleThreadExecutor { Thread(it, "diag-quick") }
     private fun refreshGate() { _gate.value = core.snapshot }
 
     /** Gate mutations run off the main thread (they end in a durable commit()). */
     private fun mutate(f: () -> Unit) = quick.execute { f(); refreshGate() }
+
     fun setNeverTouch(id: String, on: Boolean) = mutate { core.setNeverTouch(id, on) }
     fun confirm(id: String, role: Role) = mutate { core.confirmRole(id, role) }
     fun unquarantine(id: String) = mutate { core.unquarantine(id) }
@@ -60,7 +62,7 @@ class Diagnostics(private val app: LumenApp) {
 
     /** Step 0: ID list only. No per-camera contact, so "never touch" can be set first. */
     fun loadIds() = launch("Reading camera ID list") {
-        val ids = runCatching { gate.listIds() }.getOrElse { _status.value = "ID list failed: $it"; return@launch }
+        val ids = runCatching { cameraGate.listIds() }.getOrElse { _status.value = "ID list failed: $it"; return@launch }
         app.log.log("IDLIST", null, ids.toString())
         val known = _rows.value.associateBy { it.id }
         _rows.value = ids.map { known[it]?.copy(listed = true) ?: IdRow(it, true) } +
@@ -75,20 +77,22 @@ class Diagnostics(private val app: LumenApp) {
             if (_cameras.value[row.id] != null) continue
             readInternal(row.id)
         }
-        if (concurrent.isEmpty()) { concurrent = gate.concurrentIds(); persist() }
+        if (concurrent.isEmpty()) { concurrent = cameraGate.concurrentIds(); persist() }
     }
 
     private fun readInternal(id: String) {
         val row = _rows.value.firstOrNull { it.id == id } ?: return
-        val r = gate.readCharacteristics(id)
+        val r = cameraGate.readCharacteristics(id)
         val info = r.fold(
             { CharacteristicsReader.read(id, row.listed, it) },
             { CameraInfo(id = id, facing = "UNKNOWN", isLogical = false, listedInCameraIdList = row.listed, readError = it.message ?: it.toString()) },
         )
         _cameras.value = _cameras.value + (id to info)
+        
         // sub-IDs of logical cameras that the ID list does not expose become rows (read only on user request)
         val extra = info.physicalIds.filter { p -> _rows.value.none { it.id == p } }.map { IdRow(it, false, id) }
         if (extra.isNotEmpty()) _rows.value = _rows.value + extra
+        
         persist()       // after every camera
         _status.value = "Read $id: " + (info.readError ?: "ok")
     }
