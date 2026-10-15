@@ -14,6 +14,8 @@ data class ControlState(
     val flash: FlashMode = FlashMode.OFF,
     val ev: Int = 0,
     val region: MeteringRectangle? = null,
+    val isRecording: Boolean = false,
+    val recordingDurationSec: Int = 0,
 )
 
 object Controls {

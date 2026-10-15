@@ -1,5 +1,6 @@
 package lumen.app.camera
 
+import android.content.ContentValues
 import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
@@ -12,8 +13,11 @@ import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.media.ImageReader
+import android.media.MediaRecorder
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.ParcelFileDescriptor
+import android.provider.MediaStore
 import android.view.Surface
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -26,10 +30,14 @@ import lumen.core.RecoveryAction
 import lumen.core.RecoveryPolicy
 import lumen.core.Role
 import lumen.core.ZoomPlan
+import lumen.core.parseSize
 import lumen.core.pickJpegSize
 import lumen.core.pickPreviewSize
 import lumen.core.presetsFor
-import lumen.core.snapshotFromJson
+import lumen.core.Sz
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 sealed interface CamUi {
     data object Idle : CamUi
@@ -51,6 +59,8 @@ data class ViewState(
     val notice: String? = null,
     val capturing: Boolean = false,
     val lastSaved: String? = null,
+    val isRecording: Boolean = false,
+    val recordingDurationSec: Int = 0,
     val front: Boolean = false,
     val aspect: Float = 0.75f,   // portrait width/height of the preview
 )
@@ -86,6 +96,9 @@ class CameraController(private val app: LumenApp) {
     private var ticket: Ticket? = null
     private var previewSurface: Surface? = null
     private var jpegReader: ImageReader? = null
+    private var recorder: MediaRecorder? = null
+    private var recorderSurface: Surface? = null
+    private var recordingSink: RecordingSink? = null
     private var curRole: Role? = null
     private var curId: String? = null
     private var firstFrame = false
@@ -100,6 +113,14 @@ class CameraController(private val app: LumenApp) {
     private val captureTimeout = Runnable { capturePhase = Phase.IDLE; _state.update { it.copy(capturing = false, notice = "Capture timed out") } }
     private val focusReset = Runnable { controls = controls.copy(region = null); pushRepeating() }
     private val closeWatchdog = Runnable { runPendingAfterClose() }
+    private val recordingTicker = object : Runnable {
+        override fun run() {
+            if (!controls.isRecording) return
+            controls = controls.copy(recordingDurationSec = controls.recordingDurationSec + 1)
+            _state.update { it.copy(recordingDurationSec = controls.recordingDurationSec) }
+            h.postDelayed(this, 1000)
+        }
+    }
 
     // ------------------------------------------------------------------ public API
     fun attachSurface(st: SurfaceTexture) = h.post { surfaceTexture = st; if (started) openForCurrentZoom() }
@@ -115,6 +136,16 @@ class CameraController(private val app: LumenApp) {
     fun stop() = h.post { started = false; queuedRole = null; closeCurrent { }; _state.update { it.copy(ui = CamUi.Idle) } }
     fun retry() = h.post { recovery.manualRetry(); if (reloadMapping() && surfaceTexture != null) openForCurrentZoom() }
     fun setDeviceRotation(deg: Int) = h.post { deviceRotation = deg }
+    fun toggleLens() = h.post {
+        if (!started || opening || controls.isRecording) return@post
+        val target = if (curRole == Role.FRONT) preferredRearRole() else Role.FRONT
+        if (target == null || target == curRole) return@post
+        openRole(target, "Switching lens")
+    }
+    fun toggleRecording() = h.post {
+        if (controls.isRecording) stopRecording("Recording stopped")
+        else startRecording()
+    }
 
     fun requestZoom(z: Float) = h.post {
         val p = plan ?: return@post
@@ -201,6 +232,13 @@ class CameraController(private val app: LumenApp) {
         if (mainEq <= 0f) return emptyMap()
         return roleToId.mapNotNull { (r, id) -> infos[id]?.equiv35?.takeIf { it > 0f }?.let { r to (it / mainEq) } }.toMap()
             .mapValues { (r, v) -> snap(r, v) }
+    }
+
+    private fun preferredRearRole(): Role? = when {
+        roleToId.containsKey(Role.MAIN) -> Role.MAIN
+        roleToId.containsKey(Role.ULTRA_WIDE) -> Role.ULTRA_WIDE
+        roleToId.containsKey(Role.TELE_3X) -> Role.TELE_3X
+        else -> availableRoles().keys.firstOrNull { it != Role.FRONT }
     }
 
     /** Within 12% of the nominal ratio use the nominal (0.6/1/3), otherwise keep the measured value. */
