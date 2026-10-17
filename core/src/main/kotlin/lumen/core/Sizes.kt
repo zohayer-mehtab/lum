@@ -20,12 +20,22 @@ fun pickJpegSize(sizes: List<String>, maxPixels: Long = 12_500_000L): Sz? {
     return ok.filter { it.is43() }.maxByOrNull { it.area } ?: ok.maxByOrNull { it.area } ?: all.minByOrNull { it.area }
 }
 
-/** Preview: largest 4:3 size with width (long side) <= maxLong; falls back to any size with matching aspect of [still]. */
-fun pickPreviewSize(sizes: List<String>, still: Sz?, maxLong: Int = 1600): Sz? {
+fun Sz.longShortRatio(): Float = maxOf(w, h).toFloat() / minOf(w, h)
+
+/** Same aspect within [tol] (vendors ship sizes like 4000x2252 for 16:9, which is not exact). */
+fun sameAspect(a: Sz, b: Sz, tol: Float = 0.01f) = kotlin.math.abs(a.longShortRatio() / b.longShortRatio() - 1f) <= tol
+
+/** Preview: largest size with the still's aspect (else 4:3, else any) up to [maxArea] (1080p); else the smallest of the pool. */
+fun pickPreviewSize(sizes: List<String>, still: Sz?, maxArea: Long = 2_073_600L): Sz? {
     val all = sizes.mapNotNull(::parseSize); if (all.isEmpty()) return null
-    val sameAspect = all.filter { still != null && it.w.toLong() * still.h == it.h.toLong() * still.w }
-    val pool = sameAspect.ifEmpty { all.filter { it.is43() } }.ifEmpty { all }
-    return pool.filter { maxOf(it.w, it.h) <= maxLong }.maxByOrNull { it.area } ?: pool.minByOrNull { it.area }
+    val pool = all.filter { still != null && sameAspect(it, still) }.ifEmpty { all.filter { it.is43() } }.ifEmpty { all }
+    return pool.filter { it.area <= maxArea }.maxByOrNull { it.area } ?: pool.minByOrNull { it.area }
+}
+
+/** Motion Photo clip size: largest video size with the still's aspect up to [maxArea]; null if none. */
+fun pickMotionSize(videoSizes: List<String>, still: Sz?, maxArea: Long = 2_800_000L): Sz? {
+    if (still == null) return null
+    return videoSizes.mapNotNull(::parseSize).filter { sameAspect(it, still) && it.area <= maxArea }.maxByOrNull { it.area }
 }
 
 /** Smallest YUV size >= 320 on the long side, for probe frames. */

@@ -18,15 +18,22 @@ import android.view.Surface
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
+import java.util.concurrent.ConcurrentLinkedQueue
 import lumen.app.LumenApp
+import lumen.core.AspectOpt
 import lumen.core.CameraInfo
+import lumen.core.Feature
+import lumen.core.Filters
 import lumen.core.Lens
 import lumen.core.Purpose
 import lumen.core.RecoveryAction
 import lumen.core.RecoveryPolicy
 import lumen.core.Role
 import lumen.core.ZoomPlan
+import lumen.core.aspectOptions
+import lumen.core.featuresOf
 import lumen.core.pickJpegSize
+import lumen.core.pickMotionSize
 import lumen.core.pickPreviewSize
 import lumen.core.presetsFor
 import lumen.core.snapshotFromJson
@@ -53,6 +60,14 @@ data class ViewState(
     val lastSaved: String? = null,
     val front: Boolean = false,
     val aspect: Float = 0.75f,   // portrait width/height of the preview
+    val aspects: List<AspectOpt> = emptyList(),
+    val aspectId: String = "4:3",
+    val timer: Int = 0,
+    val countdown: Int? = null,
+    val filterId: String = Filters.NONE_ID,
+    val motionAvailable: Boolean = false,
+    val motion: Boolean = false,
+    val canFlip: Boolean = false,
 )
 
 /**
@@ -65,8 +80,11 @@ class CameraController(private val app: LumenApp) {
     private val log = app.log
     private val saveThread = HandlerThread("save").also { it.start() }
     private val saveHandler = Handler(saveThread.looper)
+    private val settings = app.settings
 
-    private val _state = MutableStateFlow(ViewState())
+    private val _state = MutableStateFlow(
+        ViewState(aspectId = settings.aspectId, timer = settings.timer, filterId = settings.filterId, motion = settings.motion)
+    )
     val state: StateFlow<ViewState> = _state
 
     // ---- camera-thread state ----
@@ -94,12 +112,28 @@ class CameraController(private val app: LumenApp) {
     private var deviceRotation = 0
     private var capturePhase = Phase.IDLE
     private var sawPrecapture = false
+    private var aspectId = settings.aspectId
+    private var timerSec = settings.timer
+    private var filterId = settings.filterId
+    private var motionWanted = settings.motion
+    private val motionBlocked = HashSet<String>()     // camera ids whose session failed with the Motion Photo stream
+    private var recorder: MotionRecorder? = null
+    private var streamAspect = 0f                      // w/h of the still stream in sensor space
+    private var countdown = 0
+    private val shots = ConcurrentLinkedQueue<Shot>()
     private enum class Phase { IDLE, PRECAPTURE, STILL }
 
     private val firstFrameWatchdog = Runnable { fail("no frames within ${FIRST_FRAME_MS}ms") }
     private val captureTimeout = Runnable { capturePhase = Phase.IDLE; _state.update { it.copy(capturing = false, notice = "Capture timed out") } }
     private val focusReset = Runnable { controls = controls.copy(region = null); pushRepeating() }
     private val closeWatchdog = Runnable { runPendingAfterClose() }
+    private val tick = object : Runnable {
+        override fun run() {
+            countdown--
+            if (countdown <= 0) { countdown = 0; _state.update { it.copy(countdown = null) }; captureNow() }
+            else { _state.update { it.copy(countdown = countdown) }; h.postDelayed(this, 1000) }
+        }
+    }
 
     // ------------------------------------------------------------------ public API
     fun attachSurface(st: SurfaceTexture) = h.post { surfaceTexture = st; if (started) openForCurrentZoom() }
@@ -134,7 +168,7 @@ class CameraController(private val app: LumenApp) {
         val info = curInfo() ?: return@post
         val sess = session ?: return@post
         val dev = device ?: return@post
-        val rect = Controls.meteringRect(info, controls.crop, u, v)
+        val rect = Controls.meteringRect(info, controls.crop, u, v, streamAspect, mirrored = info.facing == "FRONT")
         controls = controls.copy(region = rect)
         try {
             val b = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply { addTarget(previewSurface!!) }
@@ -146,9 +180,53 @@ class CameraController(private val app: LumenApp) {
         } catch (e: Exception) { log.log("WARN", curId, "tap focus failed: $e") }
     }
 
-    fun capture() = h.post {
-        val info = curInfo() ?: return@post
+    /** Shutter button: starts the timer countdown (if set), cancels a running countdown, else captures. */
+    fun shutter() = h.post {
+        if (countdown > 0) { cancelCountdown(); return@post }
         if (session == null || capturePhase != Phase.IDLE || !firstFrame) return@post
+        if (timerSec > 0) { countdown = timerSec; _state.update { it.copy(countdown = countdown) }; h.postDelayed(tick, 1000) }
+        else captureNow()
+    }
+
+    fun setAspect(id: String) = h.post {
+        if (id == aspectId) return@post
+        aspectId = id; settings.aspectId = id
+        _state.update { it.copy(aspectId = id) }
+        reopenCurrent("Changing format")
+    }
+
+    fun setTimer(sec: Int) = h.post { cancelCountdown(); timerSec = sec; settings.timer = sec; _state.update { it.copy(timer = sec) } }
+
+    fun setFilter(id: String) = h.post { filterId = id; settings.filterId = id; _state.update { it.copy(filterId = id) } }
+
+    fun setMotion(on: Boolean) = h.post {
+        motionWanted = on; settings.motion = on
+        _state.update { it.copy(motion = on) }
+        reopenCurrent(if (on) "Enabling Motion Photo" else "Disabling Motion Photo")
+    }
+
+    /** Rear <-> front. Goes through the same guarded open as every lens change. */
+    fun flip() = h.post {
+        if (!started || surfaceTexture == null || opening) return@post
+        val target = if (curRole == Role.FRONT) plan?.route(zoom, null)?.role
+        else Role.FRONT.takeIf { r -> roleToId[r]?.let { !recovery.isUnavailable(it) } == true }
+        if (target == null || roleToId[target] == null) { _state.update { it.copy(notice = "No other camera available") }; return@post }
+        openRole(target, if (target == Role.FRONT) "Switching to front camera" else "Switching to rear camera")
+    }
+
+    private fun reopenCurrent(msg: String) {
+        val r = curRole ?: return
+        if (started && surfaceTexture != null && !opening) openRole(r, msg)   // while opening, createSession reads the new values
+    }
+
+    private fun cancelCountdown() {
+        h.removeCallbacks(tick)
+        if (countdown != 0) { countdown = 0; _state.update { it.copy(countdown = null) } }
+    }
+
+    private fun captureNow() {
+        val info = curInfo() ?: return
+        if (session == null || capturePhase != Phase.IDLE || !firstFrame) return
         _state.update { it.copy(capturing = true) }
         h.removeCallbacks(captureTimeout); h.postDelayed(captureTimeout, CAPTURE_TIMEOUT_MS)
         if (Controls.flashFires(info, controls.flash)) startPrecapture(info) else doStill(info)
@@ -190,6 +268,7 @@ class CameraController(private val app: LumenApp) {
                 zoomFloor = p?.floor ?: 1f, zoomCeil = p?.ceiling ?: 1f, zoom = zoom,
                 presets = p?.let { pl -> presetsFor(pl) }.orEmpty(),
                 lensPills = p?.lenses?.map { l -> l.nativeRatio }.orEmpty(),
+                canFlip = Role.FRONT in av && av.keys.any { r -> r != Role.FRONT },
                 notice = notices.firstOrNull() ?: it.notice?.takeIf { n -> n.startsWith("Saved") },
             )
         }
@@ -256,7 +335,10 @@ class CameraController(private val app: LumenApp) {
 
     private fun createSession(dev: CameraDevice, info: CameraInfo, st: SurfaceTexture, myGen: Int) {
         try {
-            val jpeg = pickJpegSize(info.jpegSizes) ?: error("no JPEG size")
+            val opts = aspectOptions(info.jpegSizes)
+            val opt = opts.firstOrNull { it.id == aspectId } ?: opts.firstOrNull { it.id == "4:3" } ?: opts.firstOrNull()
+            val jpeg = opt?.jpeg ?: pickJpegSize(info.jpegSizes) ?: error("no JPEG size")
+            streamAspect = jpeg.w.toFloat() / jpeg.h
             val prev = pickPreviewSize(info.previewSizes, jpeg) ?: error("no preview size")
             st.setDefaultBufferSize(prev.w, prev.h)
             val swap = info.sensorOrientation % 180 == 90
@@ -265,13 +347,36 @@ class CameraController(private val app: LumenApp) {
             val reader = ImageReader.newInstance(jpeg.w, jpeg.h, ImageFormat.JPEG, 2)
             reader.setOnImageAvailableListener({ r ->
                 val img = r.acquireNextImage() ?: return@setOnImageAvailableListener
-                val res = StillSaver.save(app, img)
-                _state.update { it.copy(lastSaved = res.getOrNull(), notice = if (res.isSuccess) "Saved ${res.getOrNull()}" else "Save failed: ${res.exceptionOrNull()?.message}") }
+                val shot = shots.poll()
+                val ts = img.timestamp
+                val res = runCatching { StillSaver.bytesAndClose(img) }
+                    .fold({ bytes -> PhotoPipeline.process(app, bytes, ts, shot) }, { e -> Result.failure<SaveResult>(e) })
+                _state.update { cur ->
+                    res.fold(
+                        { ok -> cur.copy(lastSaved = ok.name, notice = "Saved ${ok.name}" + (ok.warn?.let { w -> " ($w)" } ?: "")) },
+                        { e -> cur.copy(notice = "Save failed: ${e.message}") },
+                    )
+                }
             }, saveHandler)
             jpegReader = reader
+            var rec: MotionRecorder? = null
+            if (motionWanted && Feature.MOTION_PHOTO in featuresOf(info) && info.id !in motionBlocked) {
+                val ms = pickMotionSize(info.videoSizes, jpeg)
+                if (ms != null) {
+                    MotionRecorder.create(ms.w, ms.h)
+                        .onSuccess { rec = it }
+                        .onFailure { e ->
+                            log.log("WARN", info.id, "motion encoder: $e")
+                            _state.update { it.copy(notice = "Motion Photo unavailable: ${e.message}") }
+                        }
+                }
+            }
+            recorder = rec
+            val outputs = arrayListOf(OutputConfiguration(ps), OutputConfiguration(reader.surface))
+            rec?.let { outputs += OutputConfiguration(it.surface) }
             val cfg = SessionConfiguration(
                 SessionConfiguration.SESSION_REGULAR,
-                listOf(OutputConfiguration(ps), OutputConfiguration(reader.surface)),
+                outputs,
                 { h.post(it) },
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(s: CameraCaptureSession) {
@@ -282,7 +387,17 @@ class CameraController(private val app: LumenApp) {
                         pushRepeating()
                         h.removeCallbacks(firstFrameWatchdog); h.postDelayed(firstFrameWatchdog, FIRST_FRAME_MS)
                     }
-                    override fun onConfigureFailed(s: CameraCaptureSession) { if (myGen == gen) fail("session configure failed") }
+                    override fun onConfigureFailed(s: CameraCaptureSession) {
+                        if (myGen != gen) return
+                        val id = curId; val role = curRole
+                        if (recorder != null && id != null && role != null) {
+                            // Not a camera fault: this lens/stream combination is unsupported. Retry once without Motion Photo.
+                            motionBlocked += id
+                            log.log("WARN", id, "session with Motion Photo stream failed; Motion Photo disabled for this camera")
+                            _state.update { it.copy(notice = "Motion Photo isn't supported on this lens; off here") }
+                            openRole(role, "Reconfiguring")
+                        } else fail("session configure failed")
+                    }
                 })
             dev.createCaptureSession(cfg)
         } catch (e: Exception) { fail("session setup: $e") }
@@ -293,8 +408,12 @@ class CameraController(private val app: LumenApp) {
         val p = plan
         val crop = if (role == Role.FRONT || p == null) 1f else p.route(zoom, role).crop
         controls = controls.copy(crop = crop)
+        val opts = aspectOptions(info.jpegSizes)
+        val shown = opts.firstOrNull { it.id == aspectId } ?: opts.firstOrNull { it.id == "4:3" } ?: opts.firstOrNull()
         _state.update {
             it.copy(front = role == Role.FRONT, flashAvailable = info.flashAvailable,
+                aspects = if (Feature.ASPECT in featuresOf(info)) opts else emptyList(), aspectId = shown?.id ?: it.aspectId,
+                motionAvailable = Feature.MOTION_PHOTO in featuresOf(info) && info.id !in motionBlocked,
                 evMin = info.aeCompMin, evMax = info.aeCompMax, evStep = info.aeCompStep,
                 ev = controls.ev.coerceIn(info.aeCompMin, info.aeCompMax),
                 flash = if (info.flashAvailable) controls.flash else FlashMode.OFF)
@@ -326,7 +445,7 @@ class CameraController(private val app: LumenApp) {
         val dev = device ?: return; val sess = session ?: return; val info = curInfo() ?: return
         val ps = previewSurface ?: return
         try {
-            val b = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply { addTarget(ps) }
+            val b = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply { addTarget(ps); recorder?.let { addTarget(it.surface) } }
             Controls.apply(b, info, controls)
             sess.setRepeatingRequest(b.build(), previewCb, h)
         } catch (e: Exception) { log.log("WARN", curId, "setRepeatingRequest: $e") }
@@ -355,13 +474,14 @@ class CameraController(private val app: LumenApp) {
             b.set(CaptureRequest.CONTROL_AF_MODE, Controls.afMode(info))
             b.set(CaptureRequest.JPEG_QUALITY, 95.toByte())
             val rot = deviceRotation
-            b.set(CaptureRequest.JPEG_ORIENTATION,
-                if (info.facing == "FRONT") (info.sensorOrientation - rot + 360) % 360 else (info.sensorOrientation + rot) % 360)
+            val orientation = if (info.facing == "FRONT") (info.sensorOrientation - rot + 360) % 360 else (info.sensorOrientation + rot) % 360
+            b.set(CaptureRequest.JPEG_ORIENTATION, orientation)
+            shots.add(Shot(filterId, recorder, orientation))
             sess.capture(b.build(), object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) { endCapture(null) }
-                override fun onCaptureFailed(s: CameraCaptureSession, r: CaptureRequest, f: CaptureFailure) { endCapture("Capture failed (reason ${f.reason})") }
+                override fun onCaptureFailed(s: CameraCaptureSession, r: CaptureRequest, f: CaptureFailure) { shots.poll(); endCapture("Capture failed (reason ${f.reason})") }
             }, h)
-        } catch (e: Exception) { endCapture("Capture error: ${e.message}") }
+        } catch (e: Exception) { shots.poll(); endCapture("Capture error: ${e.message}") }
     }
 
     private fun endCapture(err: String?) {
@@ -407,10 +527,13 @@ class CameraController(private val app: LumenApp) {
     private fun closeCurrent(then: () -> Unit) {
         gen++
         h.removeCallbacks(firstFrameWatchdog); h.removeCallbacks(captureTimeout); h.removeCallbacks(focusReset)
+        cancelCountdown()
         capturePhase = Phase.IDLE
+        shots.clear()
         ticket?.let { gate.finish(it, firstFrame, "closing") }; ticket = null
         runCatching { session?.close() }; session = null
         runCatching { jpegReader?.close() }; jpegReader = null
+        recorder?.stop(); recorder = null
         runCatching { previewSurface?.release() }; previewSurface = null
         val d = device; device = null; firstFrame = false
         if (d == null) { pendingAfterClose = null; then(); return }

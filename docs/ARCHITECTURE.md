@@ -1,4 +1,4 @@
-# Lumen architecture (Phases 1-2)
+# Lumen architecture (Phases 1-3)
 
 **Goal:** a Camera2 app that can never touch the dead 10x periscope of a Galaxy S21 Ultra. Everything device-specific comes from runtime data.
 
@@ -23,5 +23,10 @@ Preview (TextureView, 4:3) + JPEG ImageReader in one `SessionConfiguration`. Zoo
 4. Which max-resolution / video sizes / concurrent sets exist (for Phases 3-5)?
 5. Does Samsung's service reject any open while the dead sensor is initialised (then even probing the main may fail)?
 
-## Phases 3-5 hooks
-`Capabilities` per camera + `CameraInfo` sizes/ranges feed a future feature registry; `ZoomPlan`, `ControlState`, and `CameraController` session building are the extension points (modes add outputs/templates without changing gate or recovery).
+## Phase 3 additions (Drop A)
+- `:core`: `Aspect` (`aspectOptions`, tolerant 1% aspect match), `Filters` (4x5 matrices, pure), `Features` (`featuresOf` registry per camera), `Motion` (`MotionWindow` ring/clip selection, `MotionContainer` XMP + JPEG splice), `Sizes` (`pickPreviewSize` now area-capped 1080p and aspect-tolerant, `pickMotionSize`). All unit-tested; `Phase3Test` uses the real device snapshot fixture.
+- `:app`: `MotionRecorder` (surface AVC encoder + ring buffer + MediaMuxer), `PhotoPipeline` (filter -> motion container -> MediaStore, on the save thread), `Settings` (SharedPreferences), `CameraController` (aspect/timer/filter/motion/flip; JPEG metadata travels with a `Shot` queue so late-arriving images use the settings of the shutter press).
+- Session = preview + JPEG (+ encoder surface when Motion Photo is on). Anything that changes the stream set reopens through `openRole`, so the generation counter, gate marker and recovery policy apply unchanged.
+
+## Phases 4-5 hooks
+`Feature`/`featuresOf` + `Capabilities` gate UI; `ZoomPlan`, `ControlState`, and session building in `CameraController` are the extension points (video adds a MediaCodec/MediaRecorder output and a template; Pro adds manual `ControlState` fields clipped to the queried ISO/exposure ranges).

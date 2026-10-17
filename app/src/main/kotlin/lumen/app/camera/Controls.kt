@@ -61,19 +61,36 @@ object Controls {
         }
     }
 
+    /** Part of the sensor actually shown by a stream of [streamAspect] (w/h in sensor space): the center-cropped crop region. */
+    fun visibleRect(i: CameraInfo, crop: Float, streamAspect: Float): Rect {
+        val r = cropRect(i, crop)
+        if (streamAspect <= 0f) return r
+        val ra = r.width().toFloat() / r.height()
+        return if (streamAspect < ra) {
+            val w = (r.height() * streamAspect).toInt().coerceAtLeast(2) and 1.inv()
+            val l = r.left + (r.width() - w) / 2
+            Rect(l, r.top, l + w, r.bottom)
+        } else {
+            val h = (r.width() / streamAspect).toInt().coerceAtLeast(2) and 1.inv()
+            val t = r.top + (r.height() - h) / 2
+            Rect(r.left, t, r.right, t + h)
+        }
+    }
+
     /**
      * Maps a tap in the displayed (portrait, natural orientation) preview, normalized 0..1, to a metering
-     * rectangle in active-array coordinates, accounting for sensor orientation, front mirroring and crop.
+     * rectangle in active-array coordinates, accounting for sensor orientation, crop and stream aspect.
+     * [mirrored] = the preview is shown mirrored (front camera selfie view, see ViewfinderScreen).
      */
-    fun meteringRect(i: CameraInfo, crop: Float, u0: Float, v: Float): MeteringRectangle {
-        val u = if (i.facing == "FRONT") 1f - u0 else u0
+    fun meteringRect(i: CameraInfo, crop: Float, u0: Float, v: Float, streamAspect: Float = 0f, mirrored: Boolean = false): MeteringRectangle {
+        val u = if (mirrored) 1f - u0 else u0
         val (su, sv) = when (i.sensorOrientation) {
             90 -> v to 1f - u
             180 -> 1f - u to 1f - v
             270 -> 1f - v to u
             else -> u to v
         }
-        val r = cropRect(i, crop)
+        val r = visibleRect(i, crop, streamAspect)
         val cx = r.left + su.coerceIn(0f, 1f) * r.width()
         val cy = r.top + sv.coerceIn(0f, 1f) * r.height()
         val half = (minOf(i.activeWidth, i.activeHeight) * 0.07f).toInt().coerceAtLeast(8)
