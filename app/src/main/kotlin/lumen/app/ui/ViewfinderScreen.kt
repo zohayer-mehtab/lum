@@ -74,7 +74,7 @@ fun ViewfinderScreen(
             horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically,
         ) {
             if (hasPermission && s.flashAvailable) {
-                val label = when (s.flash) { FlashMode.OFF -> "⚡ Off"; FlashMode.AUTO -> "⚡ Auto"; FlashMode.ON -> "⚡ On" }
+                val label = when (s.flash) { FlashMode.OFF -> "  Off"; FlashMode.AUTO -> "  Auto"; FlashMode.ON -> "  On" }
                 Pill(label, selected = s.flash != FlashMode.OFF) {
                     vm.camera.setFlash(when (s.flash) { FlashMode.OFF -> FlashMode.AUTO; FlashMode.AUTO -> FlashMode.ON; FlashMode.ON -> FlashMode.OFF })
                 }
@@ -171,7 +171,7 @@ fun ViewfinderScreen(
                     s.lensPills.forEach { r -> Pill(fmtPreset(r), selected = r == sel) { vm.setZoom(r) } }
                 }
             }
-            Shutter(enabled = s.ui is CamUi.Live && !s.capturing, busy = s.capturing) { vm.camera.capture() }
+            Shutter(enabled = s.ui is CamUi.Live && !s.capturing, busy = s.capturing) { vm.camera.shutter() }
         }
     }
 }
@@ -194,7 +194,7 @@ private fun Shutter(enabled: Boolean, busy: Boolean, onClick: () -> Unit) {
 
 @Composable
 private fun PreviewSurface(modifier: Modifier, onAvailable: (SurfaceTexture) -> Unit, onDestroyed: (SurfaceTexture) -> Unit) {
-    androidx.compose.ui.viewinterop.AndroidView(
+    AndroidView(
         modifier = modifier,
         factory = { ctx ->
             TextureView(ctx).apply {
